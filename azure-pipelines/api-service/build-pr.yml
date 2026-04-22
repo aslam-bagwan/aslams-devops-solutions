@@ -1,0 +1,143 @@
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - api-service/**
+      - azure-pipelines/api-service/**
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - api-service/**
+      - azure-pipelines/api-service/**
+
+pool:
+  name: $(agentPoolName)
+  demands:
+    - docker
+
+variables:
+  - group: ci-cd-shared
+  - group: api-service-build
+  - name: buildConfiguration
+    value: Release
+  - name: dotnetVersion
+    value: 8.0.x
+  - name: projectPath
+    value: api-service
+  - name: dockerfilePath
+    value: api-service/Dockerfile
+
+stages:
+  - stage: Validate
+    displayName: Validate API PR
+    jobs:
+      - job: BuildTestDocker
+        displayName: Build, test, and validate Docker image
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: PowerShell@2
+            name: detectApi
+            displayName: Detect API project files
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                $projects = Get-ChildItem -Path "$(projectPath)" -Recurse -Filter *.csproj -ErrorAction SilentlyContinue
+                if (-not $projects) {
+                  Write-Host "##vso[task.logissue type=warning]No .csproj files found under $(projectPath). Skipping .NET steps."
+                  Write-Host "##vso[task.setvariable variable=HasDotNetProjects]false"
+                } else {
+                  Write-Host "Found $($projects.Count) .csproj file(s)."
+                  Write-Host "##vso[task.setvariable variable=HasDotNetProjects]true"
+                }
+
+                if (Test-Path "$(dockerfilePath)") {
+                  Write-Host "##vso[task.setvariable variable=HasDockerfile]true"
+                } else {
+                  Write-Host "##vso[task.logissue type=warning]Dockerfile not found at $(dockerfilePath). Skipping Docker validation."
+                  Write-Host "##vso[task.setvariable variable=HasDockerfile]false"
+                }
+
+                if (("$(HasDotNetProjects)" -eq "true") -and ("$(HasDockerfile)" -eq "true")) {
+                  Write-Host "##vso[task.setvariable variable=HasDockerBuildContext]true"
+                } else {
+                  Write-Host "##vso[task.setvariable variable=HasDockerBuildContext]false"
+                }
+
+          - task: UseDotNet@2
+            displayName: Use .NET SDK
+            condition: eq(variables['HasDotNetProjects'], 'true')
+            inputs:
+              packageType: sdk
+              version: $(dotnetVersion)
+
+          - task: DotNetCoreCLI@2
+            displayName: Restore
+            condition: eq(variables['HasDotNetProjects'], 'true')
+            inputs:
+              command: restore
+              projects: $(projectPath)/**/*.csproj
+
+          - task: DotNetCoreCLI@2
+            displayName: Build
+            condition: eq(variables['HasDotNetProjects'], 'true')
+            inputs:
+              command: build
+              projects: $(projectPath)/**/*.csproj
+              arguments: --configuration $(buildConfiguration) --no-restore
+
+          - task: PowerShell@2
+            displayName: Test if test projects exist
+            condition: eq(variables['HasDotNetProjects'], 'true')
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                $testProjects = @(
+                  Get-ChildItem -Path "$(projectPath)" -Recurse -Filter *Tests.csproj -ErrorAction SilentlyContinue
+                  Get-ChildItem -Path "$(projectPath)" -Recurse -Filter *Test.csproj -ErrorAction SilentlyContinue
+                ) | Sort-Object FullName -Unique
+
+                if (-not $testProjects) {
+                  Write-Host "##vso[task.logissue type=warning]No test projects found. Skipping tests."
+                  exit 0
+                }
+
+                foreach ($project in $testProjects) {
+                  Write-Host "Running tests for $($project.FullName)"
+                  dotnet test $project.FullName --configuration $(buildConfiguration) --no-build --logger trx --results-directory "$(Common.TestResultsDirectory)"
+                  if ($LASTEXITCODE -ne 0) {
+                    exit $LASTEXITCODE
+                  }
+                }
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: VSTest
+              testResultsFiles: $(Common.TestResultsDirectory)/*.trx
+              failTaskOnFailedTests: true
+              failTaskOnMissingResultsFile: false
+              testRunTitle: API PR Tests
+
+          - task: Docker@2
+            displayName: Docker build validation
+            condition: and(succeeded(), eq(variables['HasDockerBuildContext'], 'true'))
+            inputs:
+              command: build
+              repository: api-service
+              dockerfile: $(dockerfilePath)
+              tags: |
+                pr-$(System.PullRequest.PullRequestId)
+                $(Build.BuildId)

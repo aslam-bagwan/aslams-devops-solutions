@@ -1,0 +1,212 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - client-ng-app/**
+      - azure-pipelines/client-ng-app/**
+
+pr: none
+
+pool:
+  name: $(agentPoolName)
+  demands:
+    - docker
+
+variables:
+  - group: ci-cd-shared
+  - group: client-ng-app-build
+  - name: nodeVersion
+    value: 20.x
+  - name: projectPath
+    value: client-ng-app
+  - name: dockerfilePath
+    value: client-ng-app/Dockerfile
+  - name: imageRepository
+    value: client-ng-app
+  - name: imageTag
+    value: $(Build.BuildId)
+
+stages:
+  - stage: Build
+    displayName: Build and test Angular app
+    jobs:
+      - job: BuildAndTest
+        displayName: Install, lint, test, build
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: PowerShell@2
+            name: detectClient
+            displayName: Detect Angular project files
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                if (Test-Path "$(projectPath)/package.json") {
+                  Write-Host "##vso[task.setvariable variable=HasPackageJson]true"
+                } else {
+                  Write-Host "##vso[task.logissue type=warning]No package.json found under $(projectPath). Skipping Node steps."
+                  Write-Host "##vso[task.setvariable variable=HasPackageJson]false"
+                }
+
+          - task: NodeTool@0
+            displayName: Use Node.js
+            condition: eq(variables['HasPackageJson'], 'true')
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - task: PowerShell@2
+            displayName: Install dependencies
+            condition: eq(variables['HasPackageJson'], 'true')
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                Push-Location "$(projectPath)"
+                if (Test-Path "package-lock.json") {
+                  npm ci
+                } else {
+                  Write-Host "##vso[task.logissue type=warning]package-lock.json not found. Falling back to npm install."
+                  npm install
+                }
+                if ($LASTEXITCODE -ne 0) {
+                  exit $LASTEXITCODE
+                }
+                Pop-Location
+
+          - task: PowerShell@2
+            displayName: Run lint if script exists
+            condition: eq(variables['HasPackageJson'], 'true')
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                Push-Location "$(projectPath)"
+                $package = Get-Content package.json | ConvertFrom-Json
+                if ($package.scripts.lint) {
+                  npm run lint
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                } else {
+                  Write-Host "##vso[task.logissue type=warning]No lint script found. Skipping lint."
+                }
+                Pop-Location
+
+          - task: PowerShell@2
+            displayName: Run tests if script exists
+            condition: eq(variables['HasPackageJson'], 'true')
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                Push-Location "$(projectPath)"
+                $package = Get-Content package.json | ConvertFrom-Json
+                if ($package.scripts.'test:ci') {
+                  npm run test:ci
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                } elseif ($package.scripts.test) {
+                  npm run test -- --watch=false --code-coverage
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                } else {
+                  Write-Host "##vso[task.logissue type=warning]No test or test:ci script found. Skipping tests."
+                }
+                Pop-Location
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: |
+                $(projectPath)/**/junit.xml
+                $(projectPath)/**/TEST-*.xml
+              failTaskOnFailedTests: true
+              failTaskOnMissingResultsFile: false
+              testRunTitle: Angular Main Tests
+
+          - task: PowerShell@2
+            displayName: Run build if script exists
+            condition: eq(variables['HasPackageJson'], 'true')
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                Push-Location "$(projectPath)"
+                $package = Get-Content package.json | ConvertFrom-Json
+                if ($package.scripts.build) {
+                  npm run build
+                  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+                } else {
+                  Write-Host "##vso[task.logissue type=warning]No build script found. Skipping build."
+                }
+                Pop-Location
+
+  - stage: Package
+    displayName: Build and push Angular image
+    dependsOn: Build
+    condition: succeeded()
+    jobs:
+      - job: DockerPackage
+        displayName: Docker build and optional push
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: PowerShell@2
+            name: detectDocker
+            displayName: Detect Dockerfile and push config
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                if (Test-Path "$(dockerfilePath)") {
+                  Write-Host "##vso[task.setvariable variable=HasDockerfile]true"
+                } else {
+                  Write-Host "##vso[task.logissue type=warning]Dockerfile not found at $(dockerfilePath). Skipping Docker build and push."
+                  Write-Host "##vso[task.setvariable variable=HasDockerfile]false"
+                }
+
+                if ("$(dockerRegistryServiceConnection)" -eq "") {
+                  Write-Host "##vso[task.setvariable variable=HasRegistryConnection]false"
+                } else {
+                  Write-Host "##vso[task.setvariable variable=HasRegistryConnection]true"
+                }
+
+                if ((Test-Path "$(projectPath)/package.json") -and ("$(HasDockerfile)" -eq "true")) {
+                  Write-Host "##vso[task.setvariable variable=HasDockerBuildContext]true"
+                } else {
+                  Write-Host "##vso[task.setvariable variable=HasDockerBuildContext]false"
+                }
+
+          - task: Docker@2
+            displayName: Docker build
+            condition: eq(variables['HasDockerBuildContext'], 'true')
+            inputs:
+              command: build
+              repository: $(imageRepository)
+              dockerfile: $(dockerfilePath)
+              tags: |
+                $(imageTag)
+                latest
+
+          - task: Docker@2
+            displayName: Docker push to ACR
+            condition: and(succeeded(), eq(variables['HasDockerBuildContext'], 'true'), eq(variables['HasRegistryConnection'], 'true'))
+            inputs:
+              command: push
+              repository: $(imageRepository)
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(imageTag)
+                latest
+
+          - task: PowerShell@2
+            displayName: Warn when ACR push is not configured
+            condition: eq(variables['HasRegistryConnection'], 'false')
+            inputs:
+              targetType: inline
+              pwsh: true
+              script: |
+                Write-Host "##vso[task.logissue type=warning]dockerRegistryServiceConnection is empty. Docker image was built locally but not pushed."
